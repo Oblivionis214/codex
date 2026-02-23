@@ -13,6 +13,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::user_input::UserInput;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Weak;
 use tokio::sync::watch;
@@ -166,6 +167,65 @@ impl AgentControl {
         self.maybe_start_completion_watcher(resumed_thread.thread_id, Some(notification_source));
 
         Ok(resumed_thread.thread_id)
+    }
+
+    /// Fork the current session to create a new agent that inherits the conversation history.
+    ///
+    /// This method reads the rollout file at `rollout_path`, optionally truncates the history
+    /// before the `nth_user_message`, and spawns a new agent thread with that history.
+    pub(crate) async fn fork_agent(
+        &self,
+        config: crate::config::Config,
+        nth_user_message: usize,
+        rollout_path: PathBuf,
+        items: Vec<UserInput>,
+        session_source: Option<SessionSource>,
+    ) -> CodexResult<ThreadId> {
+        let state = self.upgrade()?;
+        let mut reservation = self.state.reserve_spawn_slot(config.agent_max_threads)?;
+
+        // Build session source with agent nickname
+        let session_source = match session_source {
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth,
+                agent_role,
+                ..
+            })) => {
+                let agent_nickname = reservation.reserve_agent_nickname(&agent_nickname_list())?;
+                SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id,
+                    depth,
+                    agent_nickname: Some(agent_nickname),
+                    agent_role,
+                })
+            }
+            Some(other) => other,
+            None => state.session_source(),
+        };
+        let notification_source = session_source.clone();
+
+        // Fork the thread with the truncated history
+        let new_thread = state
+            .fork_thread_with_source(
+                config,
+                nth_user_message,
+                rollout_path,
+                self.clone(),
+                session_source,
+            )
+            .await?;
+        reservation.commit(new_thread.thread_id);
+
+        state.notify_thread_created(new_thread.thread_id);
+
+        // Send initial input if provided
+        if !items.is_empty() {
+            self.send_input(new_thread.thread_id, items).await?;
+        }
+        self.maybe_start_completion_watcher(new_thread.thread_id, Some(notification_source));
+
+        Ok(new_thread.thread_id)
     }
 
     /// Send rich user input items to an existing agent thread.

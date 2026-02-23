@@ -390,6 +390,11 @@ impl ThreadManager {
 }
 
 impl ThreadManagerState {
+    /// Get the session source for this thread manager.
+    pub(crate) fn session_source(&self) -> SessionSource {
+        self.session_source.clone()
+    }
+
     /// Fetch a thread by ID or return ThreadNotFound.
     pub(crate) async fn get_thread(&self, thread_id: ThreadId) -> CodexResult<Arc<CodexThread>> {
         let threads = self.threads.read().await;
@@ -455,6 +460,29 @@ impl ThreadManagerState {
         self.spawn_thread_with_source(
             config,
             initial_history,
+            Arc::clone(&self.auth_manager),
+            agent_control,
+            session_source,
+            Vec::new(),
+            false,
+        )
+        .await
+    }
+
+    /// Fork an existing thread by reading history from a rollout file and optionally truncating it.
+    pub(crate) async fn fork_thread_with_source(
+        &self,
+        config: Config,
+        nth_user_message: usize,
+        rollout_path: PathBuf,
+        agent_control: AgentControl,
+        session_source: SessionSource,
+    ) -> CodexResult<NewThread> {
+        let history = RolloutRecorder::get_rollout_history(&rollout_path).await?;
+        let history = truncate_before_nth_user_message(history, nth_user_message);
+        self.spawn_thread_with_source(
+            config,
+            history,
             Arc::clone(&self.auth_manager),
             agent_control,
             session_source,

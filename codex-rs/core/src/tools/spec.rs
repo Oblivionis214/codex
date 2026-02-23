@@ -568,6 +568,51 @@ fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
     })
 }
 
+fn create_fork_agent_tool(config: &ToolsConfig) -> ToolSpec {
+    let properties = BTreeMap::from([
+        (
+            "nth_user_message".to_string(),
+            JsonSchema::Number {
+                description: Some(
+                    "Truncate history before the Nth user message (0-indexed). Default: keep all history."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "message".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Initial plain-text task for the forked agent. Use either message or items. Optional - can fork without sending new input."
+                        .to_string(),
+                ),
+            },
+        ),
+        ("items".to_string(), create_collab_input_items_schema()),
+        (
+            "agent_type".to_string(),
+            JsonSchema::String {
+                description: Some(crate::agent::role::spawn_tool_spec::build(
+                    &config.agent_roles,
+                )),
+            },
+        ),
+    ]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "fork_agent".to_string(),
+        description:
+            "Fork the current session to create a new agent that inherits the full conversation history. Use this when you need to explore multiple approaches in parallel while preserving context."
+                .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
 fn create_send_input_tool() -> ToolSpec {
     let properties = BTreeMap::from([
         (
@@ -1600,11 +1645,13 @@ pub(crate) fn build_specs(
     if config.collab_tools {
         let multi_agent_handler = Arc::new(MultiAgentHandler);
         builder.push_spec(create_spawn_agent_tool(config));
+        builder.push_spec(create_fork_agent_tool(config));
         builder.push_spec(create_send_input_tool());
         builder.push_spec(create_resume_agent_tool());
         builder.push_spec(create_wait_tool());
         builder.push_spec(create_close_agent_tool());
         builder.register_handler("spawn_agent", multi_agent_handler.clone());
+        builder.register_handler("fork_agent", multi_agent_handler.clone());
         builder.register_handler("send_input", multi_agent_handler.clone());
         builder.register_handler("resume_agent", multi_agent_handler.clone());
         builder.register_handler("wait", multi_agent_handler.clone());

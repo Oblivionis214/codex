@@ -1487,6 +1487,12 @@ impl Session {
         self.services.state_db.clone()
     }
 
+    /// Returns the path to the rollout file for this session, if available.
+    pub(crate) async fn rollout_path(&self) -> Option<PathBuf> {
+        let guard = self.services.rollout.lock().await;
+        guard.as_ref().map(|rec| rec.rollout_path.clone())
+    }
+
     /// Ensure all rollout writes are durably flushed.
     pub(crate) async fn flush_rollout(&self) {
         let recorder = {

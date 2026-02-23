@@ -82,6 +82,7 @@ impl ToolHandler for MultiAgentHandler {
             "spawn_agent" => spawn::handle(session, turn, call_id, arguments).await,
             "send_input" => send_input::handle(session, turn, call_id, arguments).await,
             "resume_agent" => resume_agent::handle(session, turn, call_id, arguments).await,
+            "fork_agent" => fork_agent::handle(session, turn, call_id, arguments).await,
             "wait" => wait::handle(session, turn, call_id, arguments).await,
             "close_agent" => close_agent::handle(session, turn, call_id, arguments).await,
             other => Err(FunctionCallError::RespondToModel(format!(
@@ -440,6 +441,171 @@ mod resume_agent {
             .agent_control
             .get_status(resumed_thread_id)
             .await)
+    }
+}
+
+mod fork_agent {
+    use super::*;
+    use crate::agent::next_thread_spawn_depth;
+    use crate::agent::role::apply_role_to_config;
+    use std::sync::Arc;
+
+    #[derive(Debug, Deserialize)]
+    struct ForkAgentArgs {
+        /// Truncate history before the Nth user message (0-indexed).
+        /// Default: keep all history (usize::MAX).
+        nth_user_message: Option<usize>,
+        message: Option<String>,
+        items: Option<Vec<UserInput>>,
+        agent_type: Option<String>,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct ForkAgentResult {
+        agent_id: String,
+    }
+
+    pub async fn handle(
+        session: Arc<Session>,
+        turn: Arc<TurnContext>,
+        call_id: String,
+        arguments: String,
+    ) -> Result<ToolOutput, FunctionCallError> {
+        let args: ForkAgentArgs = parse_arguments(&arguments)?;
+        let role_name = args
+            .agent_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|role| !role.is_empty());
+
+        // Parse input - for fork_agent, input is optional (can fork without sending new input)
+        let input_items = match (&args.message, &args.items) {
+            (Some(_), Some(_)) => {
+                return Err(FunctionCallError::RespondToModel(
+                    "Provide either message or items, but not both".to_string(),
+                ));
+            }
+            (Some(message), None) => {
+                if message.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    vec![UserInput::Text {
+                        text: message.clone(),
+                        text_elements: Vec::new(),
+                    }]
+                }
+            }
+            (None, Some(items)) => items.clone(),
+            (None, None) => Vec::new(),
+        };
+
+        let prompt = if input_items.is_empty() {
+            "[fork without initial message]".to_string()
+        } else {
+            input_preview(&input_items)
+        };
+
+        let session_source = turn.session_source.clone();
+        let child_depth = next_thread_spawn_depth(&session_source);
+        if exceeds_thread_spawn_depth_limit(child_depth, turn.config.agent_max_depth) {
+            return Err(FunctionCallError::RespondToModel(
+                "Agent depth limit reached. Solve the task yourself.".to_string(),
+            ));
+        }
+
+        // Get the rollout path from the current session
+        let rollout_path = session.rollout_path().await.ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "Cannot fork: no rollout file available for current session".to_string(),
+            )
+        })?;
+
+        // Determine truncation point
+        let nth_user_message = args.nth_user_message.unwrap_or(usize::MAX);
+
+        session
+            .send_event(
+                &turn,
+                CollabAgentSpawnBeginEvent {
+                    call_id: call_id.clone(),
+                    sender_thread_id: session.conversation_id,
+                    prompt: prompt.clone(),
+                }
+                .into(),
+            )
+            .await;
+
+        let mut config = build_agent_spawn_config(
+            &session.get_base_instructions().await,
+            turn.as_ref(),
+            child_depth,
+        )?;
+        apply_role_to_config(&mut config, role_name)
+            .await
+            .map_err(FunctionCallError::RespondToModel)?;
+        apply_spawn_agent_overrides(&mut config, child_depth);
+
+        let result = session
+            .services
+            .agent_control
+            .fork_agent(
+                config,
+                nth_user_message,
+                rollout_path,
+                input_items,
+                Some(thread_spawn_source(
+                    session.conversation_id,
+                    child_depth,
+                    role_name,
+                )),
+            )
+            .await
+            .map_err(collab_spawn_error);
+
+        let (new_thread_id, status) = match &result {
+            Ok(thread_id) => (
+                Some(*thread_id),
+                session.services.agent_control.get_status(*thread_id).await,
+            ),
+            Err(_) => (None, AgentStatus::NotFound),
+        };
+        let (new_agent_nickname, new_agent_role) = match new_thread_id {
+            Some(thread_id) => session
+                .services
+                .agent_control
+                .get_agent_nickname_and_role(thread_id)
+                .await
+                .unwrap_or((None, None)),
+            None => (None, None),
+        };
+        session
+            .send_event(
+                &turn,
+                CollabAgentSpawnEndEvent {
+                    call_id,
+                    sender_thread_id: session.conversation_id,
+                    new_thread_id,
+                    new_agent_nickname,
+                    new_agent_role,
+                    prompt,
+                    status,
+                }
+                .into(),
+            )
+            .await;
+        let new_thread_id = result?;
+
+        let content = serde_json::to_string(&ForkAgentResult {
+            agent_id: new_thread_id.to_string(),
+        })
+        .map_err(|err| {
+            FunctionCallError::Fatal(format!("failed to serialize fork_agent result: {err}"))
+        })?;
+
+        Ok(ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success: Some(true),
+        })
     }
 }
 
